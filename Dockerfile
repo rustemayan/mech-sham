@@ -4,7 +4,6 @@ ENV MECH_POLICY=polite
 # ---- experiment switches: change ONE line per submission ----
 ENV STYLE=corner
 ENV OPPORTUNIST=0
-ENV DIAG=1
 WORKDIR /bot
 COPY . .
 ENTRYPOINT ["python3", "-u", "/bot/bot.py"]
