@@ -34,6 +34,7 @@ CB_LO = float(os.environ.get('CB_LO', 15))
 CB_ALWAYS = os.environ.get('CB_ALWAYS', '0') == '1'
 STYLE = os.environ.get('STYLE', 'base')   # base | corner | farm
 FARM_T = float(os.environ.get('FARM_T', 100.0))
+ROOF_T = float(os.environ.get('ROOF_T', 25.0))
 HOSTILE_MEM = float(os.environ.get('HOSTILE_MEM', 40.0))
 TAU = 2.0 * math.pi
 PI = math.pi
@@ -76,6 +77,15 @@ class Bot:
             log("navmap failed", repr(e))
             self.nm = NavMap(None)
         self.planner = Planner(self.nm)
+        self.rctrl = None
+        if STYLE == "roof":
+            try:
+                from roof import RoofMap, RoofCtrl
+                self.rctrl = RoofCtrl(RoofMap(self.nm, mapdir), log=log)
+                log("roof spots: %d" % len(self.rctrl.rm.spots))
+            except Exception as e:
+                log("roof init failed: %r" % (e,))
+                self.rctrl = None
         self.map_s = time.perf_counter() - t0
         log("map ready in %.2fs ok=%s" % (self.map_s, self.nm.ok))
         global _BOT
@@ -380,11 +390,47 @@ class Bot:
         if stuck and (self.ticks % 4 == 0):
             act["jump"] = True
 
+        if self.rctrl is not None and t >= ROOF_T:
+            try:
+                mode = self._roof_override(obs, me, act, enemies, t, px, py, pz) or mode
+            except Exception:
+                import traceback
+                if self.ticks % 50 == 1:
+                    log("roof error:\n" + traceback.format_exc())
+
         if self.ticks % 3 == 0:
             try:
                 mf.draw.label("%s hp%.0f" % (mode, me["hp"]))
             except Exception:
                 pass
+
+    def _roof_override(self, obs, me, act, enemies, t, px, py, pz):
+        rc = self.rctrl
+        if rc.give_up:
+            return None
+        z = obs["zone"]
+        cn = (z["next_center"][0], z["next_center"][1], z["next_radius"])
+        if cn[2] < 12.0:
+            return None   # final collapse: nowhere is safe, let the normal brain fight
+        # a hostile close by while we are on the ground: fight first
+        on_ground = pz < self.nm.ground(px, py) + 3.0
+        for e in enemies:
+            if e["_host"] and e["_d"] < 32 and on_ground and rc.state != "climb":
+                return None
+        def nav(gx, gy):
+            r = self._navigate(me, {"type": "pickup", "pos": (gx, gy, 0.0), "id": None, "key": ("roofG", round(gx), round(gy))}, t)
+            return None if r is None else r[0]
+        out = rc.act(me, t, cn, cn, nav)
+        if out is None:
+            return None
+        mv = out.get("move", [0.0, 0.0])
+        act["move"] = [round(mv[0], 3), round(mv[1], 3)]
+        act["boost"] = bool(out.get("boost", False))
+        if out.get("jump"):
+            act["jump"] = True
+        else:
+            act.pop("jump", None)
+        return "roof-" + rc.state
 
     # ------------------------------------------------------------------ events and memory
     def _events(self, obs, me, t):
