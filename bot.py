@@ -32,6 +32,8 @@ COMBAT_BOOST = os.environ.get('COMBAT_BOOST', '0') == '1'
 CB_HI = float(os.environ.get('CB_HI', 50))
 CB_LO = float(os.environ.get('CB_LO', 15))
 CB_ALWAYS = os.environ.get('CB_ALWAYS', '0') == '1'
+STYLE = os.environ.get('STYLE', 'base')   # base | corner | farm
+FARM_T = float(os.environ.get('FARM_T', 100.0))
 HOSTILE_MEM = float(os.environ.get('HOSTILE_MEM', 40.0))
 TAU = 2.0 * math.pi
 PI = math.pi
@@ -283,6 +285,12 @@ class Bot:
                 D, want_boost = self._flee_vec(me, enemies, t, px, py)
             else:
                 D = self._combat_vec(me, tgt, t, px, py)
+                if STYLE == "corner":
+                    Dh = self._corner_vec(me, tgt, threats, t, px, py)
+                    if Dh is not None:
+                        D = Dh
+                        mode = "hide"
+                        want_boost = me["energy"] > 25
                 if COMBAT_BOOST:
                     en = me["energy"]
                     if en > CB_HI:
@@ -508,6 +516,8 @@ class Bot:
                     continue
                 if not OPPORTUNIST:
                     continue
+                if STYLE == "farm" and (t < FARM_T and me["cubes"] < 6):
+                    continue
                 if any(o is not e and math.dist(o["pos"], e["pos"]) < 70 for o in enemies):
                     continue
             s = d
@@ -593,7 +603,7 @@ class Bot:
                 return ((cx - px) / dd * 0.8 + ax * 0.4, (cy - py) / dd * 0.8 + ay * 0.4), me["energy"] > 25
         return (ax, ay), me["energy"] > 25
 
-    def _find_cover(self, me, enemies, px, py):
+    def _find_cover(self, me, enemies, px, py, dists=(14.0, 28.0, 44.0)):
         if not enemies:
             return None
         nm = self.nm
@@ -602,7 +612,7 @@ class Bot:
         for k in range(24):
             ang = k * TAU / 24
             ux, uy = math.cos(ang), math.sin(ang)
-            for dist in (14.0, 28.0, 44.0):
+            for dist in dists:
                 qx, qy = px + ux * dist, py + uy * dist
                 if nm.blocked(qx, qy) or not nm.clear(px, py, qx, qy):
                     continue
@@ -616,6 +626,39 @@ class Bot:
                 if s > bs:
                     best, bs = (qx, qy), s
         return best if bs > 20 else None
+
+    def _corner_vec(self, me, tgt, threats, t, px, py):
+        """Peek-and-hide: get out of sight while we cannot shoot or while a laser is being charged at us."""
+        ready = False
+        for w in me["weapons"]:
+            if not w:
+                continue
+            if w["kind"] == "gun" and w.get("ammo", 0) > 0 and w.get("reload", 0) <= 0:
+                ready = True
+            if w["kind"] == "laser" and (w["cooldown"] < 0.3 or w.get("charge", 0) > 0):
+                ready = True
+            if w["kind"] == "lightning" and tgt["_d"] < 42 and me["energy"] > 9:
+                ready = True
+        charging_at_us = False
+        for e in threats or [tgt]:
+            if e.get("charging"):
+                brg = math.atan2(py - e["pos"][1], px - e["pos"][0])
+                if abs(wrap(e["aim"][0] - brg)) < 0.12:
+                    charging_at_us = True
+        if ready and not charging_at_us:
+            return None
+        if tgt["_d"] < 25:
+            return None   # too close to hide, keep fighting
+        if t - self.cover_t > 0.5 or self.cover is None:
+            self.cover = self._find_cover(me, (threats or [tgt]), px, py, dists=(6.0, 11.0, 17.0, 24.0))
+            self.cover_t = t
+        if self.cover is None:
+            return None
+        cx, cy = self.cover
+        dd = math.hypot(cx - px, cy - py)
+        if dd < 1.5:
+            return (0.0, 0.0)
+        return ((cx - px) / dd, (cy - py) / dd)
 
     def _check_stuck(self, t):
         if t < self.stuck_until:
