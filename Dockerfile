@@ -3,7 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 ENV MECH_POLICY=polite
 # ---- experiment switches: change ONE line per submission ----
 ENV STYLE=base
-ENV OPPORTUNIST=1
+ENV OPPORTUNIST=0
 WORKDIR /bot
 COPY . .
 ENTRYPOINT ["python3", "-u", "/bot/bot.py"]
