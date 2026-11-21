@@ -15,20 +15,20 @@ from navmap import NavMap, Planner, NA
 
 FLIP_LO = float(os.environ.get('FLIP_LO', 0.2))
 FLIP_HI = float(os.environ.get('FLIP_HI', 0.6))
-PREF_GUN = float(os.environ.get('PREF_GUN', 160.0))
+PREF_GUN = float(os.environ.get('PREF_GUN', 120.0))
 POLICY = os.environ.get('MECH_POLICY', 'polite')   # polite: only fight mechs that fight us; aggro: anyone
 RECOVER_LO = float(os.environ.get('RECOVER_LO', 0.50))
 RECOVER_HI = float(os.environ.get('RECOVER_HI', 0.85))
 OPPORTUNIST = os.environ.get('OPPORTUNIST', '1') == '1'
 STICK = float(os.environ.get('STICK', 80))
 HP_W = float(os.environ.get('HP_W', 0.08))
-PREF_LASER = float(os.environ.get('PREF_LASER', 170.0))
+PREF_LASER = float(os.environ.get('PREF_LASER', 130.0))
 LIGHT_RUSH = os.environ.get('LIGHT_RUSH', '1') == '1'
 LASER_BONUS = float(os.environ.get('LASER_BONUS', 4.0))
 EARLY_CHARGE = os.environ.get('EARLY_CHARGE', '0') == '1'
 MULTI_N = int(os.environ.get('MULTI_N', 3))
 MULTI_HP = float(os.environ.get('MULTI_HP', 0.6))
-COMBAT_BOOST = os.environ.get('COMBAT_BOOST', '1') == '1'
+COMBAT_BOOST = os.environ.get('COMBAT_BOOST', '0') == '1'
 CB_HI = float(os.environ.get('CB_HI', 50))
 CB_LO = float(os.environ.get('CB_LO', 15))
 CB_ALWAYS = os.environ.get('CB_ALWAYS', '0') == '1'
@@ -125,6 +125,10 @@ class Bot:
         self.last_seen = {}         # mech id -> (t, x, y, z)
         self.kill_spots = []        # (x, y, t) where we killed something: cubes and weapons drop there
         self.recover = False
+        self.stall = {}
+        self.track_key = None
+        self.track_best = 0.0
+        self.track_t = 0.0
         self.max_ms = 0.0
         self.slow = 0
 
@@ -798,7 +802,10 @@ class Bot:
             d = math.hypot(x - px, y - py)
             if math.hypot(x - zx, y - zy) > r_ok or self._unreach(x, y, t):
                 continue
-            if v["pos"][2] - self.nm.ground(x, y) > 4.0 and v["type"] != "pickup":
+            # roof loot is out of reach for our ground navigation: skip it (it used to trap the bot under walls)
+            if v["pos"][2] - self.nm.ground(x, y) > 3.0 or self.nm.solid_at(x, y):
+                continue
+            if self.stall.get(k, -1.0) > t:
                 continue
             ty = v["type"]
             if ty == "pickup":
@@ -825,7 +832,7 @@ class Bot:
         # where we killed something: cubes (+2) and its weapons lie there
         for (kx, ky, kt) in self.kill_spots:
             d = math.hypot(kx - px, ky - py)
-            if self._unreach(kx, ky, t):
+            if self._unreach(kx, ky, t) or self.stall.get(("kill", round(kx), round(ky)), -1) > t:
                 continue
             s = 9.0 / (1.0 + d / 90.0)
             if s > bs:
@@ -851,6 +858,21 @@ class Bot:
                 best = {"type": "drop", "pos": dp["pos"], "id": dp["id"], "key": ("drop", dp["id"])}
         if best is None or bs < 0.9:
             best = self._roam_goal(me, t, px, py, zc)
+        # watchdog: a goal we do not get closer to within 10 s is dropped for 45 s
+        try:
+            key = best.get("key") or (best["type"], round(best["pos"][0] / 20), round(best["pos"][1] / 20))
+            dcur = math.hypot(best["pos"][0] - px, best["pos"][1] - py)
+            if key != self.track_key:
+                self.track_key, self.track_best, self.track_t = key, dcur, t
+            elif dcur < self.track_best - 3.0:
+                self.track_best, self.track_t = dcur, t
+            elif t - self.track_t > 10.0:
+                self.stall[key] = t + 45.0
+                self.unreach[(int(best["pos"][0] // 10), int(best["pos"][1] // 10))] = t + 45.0
+                self.track_key = None
+                best = self._roam_goal(me, t, px, py, zc)
+        except Exception:
+            pass
         self.goal = best
         self.goal_until = t + 1.5
         return best
