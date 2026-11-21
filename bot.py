@@ -16,6 +16,19 @@ from navmap import NavMap, Planner, NA
 FLIP_LO = float(os.environ.get('FLIP_LO', 0.2))
 FLIP_HI = float(os.environ.get('FLIP_HI', 0.6))
 PREF_GUN = float(os.environ.get('PREF_GUN', 120.0))
+POLICY = os.environ.get('MECH_POLICY', 'polite')   # polite: only fight mechs that fight us; aggro: anyone
+RECOVER_LO = float(os.environ.get('RECOVER_LO', 0.50))
+RECOVER_HI = float(os.environ.get('RECOVER_HI', 0.85))
+OPPORTUNIST = os.environ.get('OPPORTUNIST', '1') == '1'
+STICK = float(os.environ.get('STICK', 80))
+HP_W = float(os.environ.get('HP_W', 0.08))
+PREF_LASER = float(os.environ.get('PREF_LASER', 130.0))
+LIGHT_RUSH = os.environ.get('LIGHT_RUSH', '1') == '1'
+LASER_BONUS = float(os.environ.get('LASER_BONUS', 4.0))
+EARLY_CHARGE = os.environ.get('EARLY_CHARGE', '0') == '1'
+MULTI_N = int(os.environ.get('MULTI_N', 3))
+MULTI_HP = float(os.environ.get('MULTI_HP', 0.6))
+HOSTILE_MEM = float(os.environ.get('HOSTILE_MEM', 40.0))
 TAU = 2.0 * math.pi
 PI = math.pi
 
@@ -26,7 +39,7 @@ UPGRADE_SCORE = {
     "gun_velocity": 5.2, "jets": 3.5, "sensors": 4.4, "laser_pierce": 3.0,
     "mortar_splash": 0.5, "mortar_reload": 0.5, "mortar_velocity": 0.5,
 }
-WEAPON_RANK = {"lightning": 3, "laser": 2, "mortar": 0, "gun": 0}
+WEAPON_RANK = {"laser": 3, "lightning": 2, "mortar": 0, "gun": 0}
 
 
 def wrap(a):
@@ -103,6 +116,11 @@ class Bot:
         self.visited = deque(maxlen=12)
         self.laser_hold = 0.0
         self.ticks = 0
+        self.hostile = {}           # mech id -> last time it showed hostility
+        self.aim_streak = {}
+        self.last_seen = {}         # mech id -> (t, x, y, z)
+        self.kill_spots = []        # (x, y, t) where we killed something: cubes and weapons drop there
+        self.recover = False
         self.max_ms = 0.0
         self.slow = 0
 
@@ -191,6 +209,20 @@ class Bot:
         for e in enemies:
             e["_d"] = math.dist(e["pos"], me["pos"])
         enemies.sort(key=lambda e: e["_d"])
+        for e in enemies:
+            ex, ey = e["pos"][0], e["pos"][1]
+            self.last_seen[e["id"]] = (t, ex, ey, e["pos"][2])
+            brg = math.atan2(py - ey, px - ex)
+            off = abs(wrap(e["aim"][0] - brg))
+            if e["_d"] < 210 and off < 0.09 and self.nm.los(ex, ey, px, py):
+                k = self.aim_streak.get(e["id"], 0) + 1
+                self.aim_streak[e["id"]] = k
+                if k >= 4 or (e.get("charging") and off < 0.06):
+                    self.hostile[e["id"]] = t
+            else:
+                self.aim_streak[e["id"]] = 0
+            e["_host"] = (t - self.hostile.get(e["id"], -999.0)) < HOSTILE_MEM
+        self.kill_spots = [k for k in self.kill_spots if t - k[2] < 40 and math.hypot(k[0] - px, k[1] - py) > 4.0]
         near_enemies = [e for e in enemies if e["_d"] < 110]
 
         # ---- weapon pickup (explicit take)
@@ -217,14 +249,19 @@ class Bot:
 
         # ---- decide mode
         flee = False
+        threats = [e for e in enemies if e["_host"]]
+        if hp_frac < RECOVER_LO:
+            self.recover = True
+        if hp_frac > RECOVER_HI:
+            self.recover = False
         if tgt is not None:
-            n_close = len([e for e in enemies if e["_d"] < 90])
-            if hp_frac < 0.27 or (n_close >= 3 and hp_frac < 0.55):
-                self.flee_until = t + 2.5
-            flee = t < self.flee_until
-            if hp_frac > 0.65 and n_close <= 2:
-                flee = False
-                self.flee_until = -1.0
+            n_close = len([e for e in threats if e["_d"] < 90])
+            tgt_hp = tgt.get("hp", 1400.0)
+            finishing = tgt_hp < 0.5 * me["hp"] and tgt["_d"] < 120
+            if self.recover and not finishing and tgt["_d"] > 22:
+                flee = True
+            if n_close >= MULTI_N and hp_frac < MULTI_HP:
+                flee = True
 
         D = (0.0, 0.0)
         speed = 1.0
@@ -327,6 +364,12 @@ class Bot:
                     self.alert = (ev["bearing"], t + 2.0)
                 if ev.get("by") is not None:
                     self.last_attacker = (ev["by"], t)
+                    self.hostile[ev["by"]] = t
+            elif ty == "kill":
+                ls = self.last_seen.get(ev.get("target"))
+                if ls is not None:
+                    self.kill_spots.append((ls[1], ls[2], t))
+                self.hostile.pop(ev.get("target"), None)
             elif ty == "take_failed":
                 self.blacklist[ev.get("id")] = t + 8.0
                 self.mem.pop(("pickup", ev.get("id")), None)
@@ -438,16 +481,28 @@ class Bot:
             return None
         px, py, pz = me["pos"]
         best, bs = None, 1e9
+        hp_frac = me["hp"] / max(1.0, me["max_hp"])
+        any_host = any(e["_host"] for e in enemies)
         for e in enemies:
             d = e["_d"]
             if d > 200:
                 continue
+            if POLICY == "polite" and not e["_host"] and d > 26:
+                # leave passive mechs alone unless we are healthy, nobody else is on us, and it is alone
+                if any_host or hp_frac < 0.8 or "laser" in (e.get("weapons") or []):
+                    continue
+                if not OPPORTUNIST:
+                    continue
+                if any(o is not e and math.dist(o["pos"], e["pos"]) < 70 for o in enemies):
+                    continue
             s = d
+            if e["_host"]:
+                s -= 60
             hp = e.get("hp")
             if hp:
-                s += 0.04 * hp
+                s += HP_W * hp
             if e["id"] == self.tid and t - self.tid_t < 3.0:
-                s -= 22
+                s -= STICK
             if self.last_attacker and self.last_attacker[0] == e["id"] and t - self.last_attacker[1] < 3.0:
                 s -= 25
             if d > 45 and not self.nm.los(px, py, e["pos"][0], e["pos"][1]):
@@ -487,12 +542,10 @@ class Bot:
     def _pref_range(self, me, tgt):
         kinds = [w["kind"] for w in me["weapons"] if w]
         tw = tgt.get("weapons") or []
-        if "lightning" in kinds and me["energy"] > 18:
-            return 24.0 if "mortar" not in tw else 18.0
-        if "lightning" in tw:
-            return 75.0
         if "laser" in kinds:
-            return 95.0
+            return PREF_LASER
+        if "lightning" in kinds and "laser" in tw and me["energy"] > 25 and LIGHT_RUSH:
+            return 24.0
         return PREF_GUN
 
     def _combat_vec(self, me, tgt, t, px, py):
@@ -625,6 +678,13 @@ class Bot:
             cands.append((0.0, 0.0))
         zx, zy, zr = zc
         r_safe = max(10.0, zr - 12.0)
+        passive = []
+        if POLICY == "polite":
+            for e in obs.get("mechs", ()):
+                if e["kind"] == "mech" and not e.get("_host"):
+                    dd = math.hypot(e["pos"][0] - px, e["pos"][1] - py)
+                    if dd < 70:
+                        passive.append((e["pos"][0], e["pos"][1]))
         for (ux, uy) in cands:
             s = 0.0
             if Dn > 1e-6:
@@ -661,7 +721,7 @@ class Bot:
                             break
                 if blasts:
                     dxx, dyy = disp[3]
-                    for (bx, by, _) in blasts:
+                    for (bx, by) in blasts:
                         dd = math.hypot(px + dxx - bx, py + dyy - by)
                         if dd < 10:
                             pen += (10 - dd) / 10.0 * 1.5
@@ -677,6 +737,10 @@ class Bot:
                         if lat < 4.5:
                             pen += (4.5 - lat) / 4.5
             s -= 3.2 * pen
+            for (bx, by) in passive:
+                q = math.hypot(px + ux * vmax - bx, py + uy * vmax - by)
+                if q < 60:
+                    s -= (60 - q) / 60.0 * 1.2
             # zone
             qx, qy = px + ux * vmax * 1.6, py + uy * vmax * 1.6
             dzone = math.hypot(qx - zx, qy - zy)
@@ -730,7 +794,7 @@ class Bot:
                 w = self._wanted_pickup(me, v["kind"])
                 if not w or self.blacklist.get(v["id"], -1) > t:
                     continue
-                val = (12.0 if not have_s1 else 7.0) + (2.0 if v["kind"] == "lightning" else 0.0)
+                val = (12.0 if not have_s1 else 7.0) + (LASER_BONUS if v["kind"] == "laser" else 0.0)
             elif ty == "cube":
                 val = 6.5 if cubes_held < 10 else 3.0
             elif ty == "crate":
@@ -747,6 +811,15 @@ class Bot:
             if s > bs:
                 bs = s
                 best = {"type": ty, "pos": v["pos"], "id": v["id"], "key": k}
+        # where we killed something: cubes (+2) and its weapons lie there
+        for (kx, ky, kt) in self.kill_spots:
+            d = math.hypot(kx - px, ky - py)
+            if self._unreach(kx, ky, t):
+                continue
+            s = 9.0 / (1.0 + d / 90.0)
+            if s > bs:
+                bs = s
+                best = {"type": "cube", "pos": (kx, ky, 0.0), "id": None, "key": ("kill", round(kx), round(ky))}
         # supply drops
         for dp in obs.get("drops", ()):
             x, y = dp["pos"][0], dp["pos"][1]
@@ -777,6 +850,8 @@ class Bot:
             return g["type"] == "roam" and math.hypot(g["pos"][0] - px, g["pos"][1] - py) > 8 and t - self.roam_t < 18
         if g["type"] == "drop":
             return True
+        if k[0] == "kill":
+            return any(round(a) == k[1] and round(b) == k[2] for a, b, _ in self.kill_spots)
         return k in self.mem
 
     def _roam_goal(self, me, t, px, py, zc):
@@ -879,8 +954,16 @@ class Bot:
     # ------------------------------------------------------------------ aim and fire
     def _idle_aim(self, obs, me, t, mv):
         yaw, pit = me["aim"]
+        px, py = me["pos"][0], me["pos"][1]
         if self.alert is not None and t < self.alert[1]:
             return (self.alert[0], 0.0)
+        best = None
+        for mid, ht in self.hostile.items():
+            ls = self.last_seen.get(mid)
+            if ls and t - ht < 30 and t - ls[0] < 20 and (best is None or ls[0] > best[0]):
+                best = ls
+        if best is not None:
+            return (math.atan2(best[2] - py, best[1] - px), 0.0)
         # sweep: slow rotation so the 120 degree wedge covers everything over time
         self.scan_yaw = wrap(self.scan_yaw + 0.13)
         if math.hypot(*mv) > 0.1 and int(t / 4.0) % 2 == 0:
@@ -993,9 +1076,36 @@ class Bot:
                     fire[las_slot] = True
             else:
                 self.laser_hold = 0.0
-                if aligned and has_los and w["cooldown"] <= 0.12 and d2 > 20.0 and me["weapons"][las_slot]["cooldown"] < 0.2:
+                if has_los and w["cooldown"] <= 0.12 and d2 > 20.0 and (aligned or (EARLY_CHARGE and eyaw < 0.6)):
                     fire[las_slot] = True
+        if POLICY == "polite" and tgt.get("kind") == "mech":
+            self._crossfire_guard(obs, me, tgt, fire, want_yaw, d3, origin)
         return (want_yaw, want_pit), fire
+
+    def _crossfire_guard(self, obs, me, tgt, fire, yaw, d3, origin):
+        """Do not hit passive bystanders (it would turn them on us)."""
+        ux, uy = math.cos(yaw), math.sin(yaw)
+        weapons = me["weapons"]
+        for b in obs.get("mechs", ()):
+            if b["kind"] != "mech" or b["id"] == tgt["id"] or b.get("_host"):
+                continue
+            rx, ry = b["pos"][0] - origin[0], b["pos"][1] - origin[1]
+            along = rx * ux + ry * uy
+            perp = abs(rx * uy - ry * ux)
+            dtb = math.hypot(b["pos"][0] - tgt["pos"][0], b["pos"][1] - tgt["pos"][1])
+            for i, w in enumerate(weapons):
+                if not w or not fire[i]:
+                    continue
+                k = w["kind"]
+                if k == "gun" and 0 < along < d3 + 60 and perp < 6.5:
+                    fire[i] = False
+                elif k == "lightning":
+                    db = math.hypot(rx, ry)
+                    cone = math.radians(w["stats"].get("cone_deg", 30.0))
+                    if dtb < w["stats"].get("chain_range", 14.0) + 4 or (db < w["stats"].get("range", 45.0) + 3 and db < d3 + 3 and abs(wrap(math.atan2(ry, rx) - yaw)) < cone + 0.1):
+                        fire[i] = False
+                elif k == "laser" and w.get("charge", 0) > 0 and 0 < along < d3 + 5 and perp < 5.0:
+                    fire[i] = True   # keep charging instead of releasing into a bystander
 
 
 def dist_goal_small(goal, px, py):
