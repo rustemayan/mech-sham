@@ -15,19 +15,23 @@ from navmap import NavMap, Planner, NA
 
 FLIP_LO = float(os.environ.get('FLIP_LO', 0.2))
 FLIP_HI = float(os.environ.get('FLIP_HI', 0.6))
-PREF_GUN = float(os.environ.get('PREF_GUN', 120.0))
+PREF_GUN = float(os.environ.get('PREF_GUN', 160.0))
 POLICY = os.environ.get('MECH_POLICY', 'polite')   # polite: only fight mechs that fight us; aggro: anyone
 RECOVER_LO = float(os.environ.get('RECOVER_LO', 0.50))
 RECOVER_HI = float(os.environ.get('RECOVER_HI', 0.85))
 OPPORTUNIST = os.environ.get('OPPORTUNIST', '1') == '1'
 STICK = float(os.environ.get('STICK', 80))
 HP_W = float(os.environ.get('HP_W', 0.08))
-PREF_LASER = float(os.environ.get('PREF_LASER', 130.0))
+PREF_LASER = float(os.environ.get('PREF_LASER', 170.0))
 LIGHT_RUSH = os.environ.get('LIGHT_RUSH', '1') == '1'
 LASER_BONUS = float(os.environ.get('LASER_BONUS', 4.0))
 EARLY_CHARGE = os.environ.get('EARLY_CHARGE', '0') == '1'
 MULTI_N = int(os.environ.get('MULTI_N', 3))
 MULTI_HP = float(os.environ.get('MULTI_HP', 0.6))
+COMBAT_BOOST = os.environ.get('COMBAT_BOOST', '1') == '1'
+CB_HI = float(os.environ.get('CB_HI', 50))
+CB_LO = float(os.environ.get('CB_LO', 15))
+CB_ALWAYS = os.environ.get('CB_ALWAYS', '0') == '1'
 HOSTILE_MEM = float(os.environ.get('HOSTILE_MEM', 40.0))
 TAU = 2.0 * math.pi
 PI = math.pi
@@ -275,6 +279,13 @@ class Bot:
                 D, want_boost = self._flee_vec(me, enemies, t, px, py)
             else:
                 D = self._combat_vec(me, tgt, t, px, py)
+                if COMBAT_BOOST:
+                    en = me["energy"]
+                    if en > CB_HI:
+                        self.cboost = True
+                    elif en < CB_LO:
+                        self.cboost = False
+                    want_boost = getattr(self, "cboost", False) and (bool(obs["projectiles"]) or tgt.get("charging") or CB_ALWAYS)
             # keep to the zone while fighting
             if zone_urgent:
                 zx, zy = zone_goal
