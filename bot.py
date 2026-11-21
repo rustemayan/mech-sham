@@ -76,7 +76,11 @@ class Bot:
             log("navmap failed", repr(e))
             self.nm = NavMap(None)
         self.planner = Planner(self.nm)
-        log("map ready in %.2fs ok=%s" % (time.perf_counter() - t0, self.nm.ok))
+        self.map_s = time.perf_counter() - t0
+        log("map ready in %.2fs ok=%s" % (self.map_s, self.nm.ok))
+        global _BOT
+        _BOT = self
+        self.diag_ms = []
         gc.collect()
         try:
             gc.freeze()
@@ -172,6 +176,11 @@ class Bot:
             except Exception:
                 pass
         ms = (time.perf_counter() - t_start) * 1000.0
+        self.diag_ms.append(ms)
+        if DIAG and self.ticks == 250:
+            _diag_report(self)
+            sys.stdout.write("DIAG-REPORT-SEE-STDERR\n")   # deliberately break the protocol so the check shows stderr
+            sys.stdout.flush()
         if ms > self.max_ms:
             self.max_ms = ms
         if ms > 35:
@@ -1191,5 +1200,20 @@ def dist_goal_small(goal, px, py):
         return False
 
 
+_BOT = None
+DIAG = os.environ.get("DIAG") == "1"
+
+
+def _diag_report(b):
+    ms = sorted(b.diag_ms)
+    def pct(p):
+        return ms[min(len(ms) - 1, int(p * len(ms)))] if ms else -1
+    sys.stderr.write("DIAG map_ok=%s map_load_s=%.2f solid_cells=%d prisms_ok=%s obs=%d tick_ms p50=%.1f p90=%.1f p99=%.1f max=%.1f cpus=%s py=%s arena=%s\n" % (
+        b.nm.ok, b.map_s, sum(sum(r) for r in b.nm.solid), b.nm.tn is not None, len(ms),
+        pct(0.5), pct(0.9), pct(0.99), ms[-1] if ms else -1, os.cpu_count(), sys.version.split()[0],
+        os.listdir("/arena") if os.path.isdir("/arena") else "missing"))
+    sys.stderr.flush()
+
 if __name__ == "__main__":
+    _t0 = time.perf_counter()
     mf.run(Bot)
